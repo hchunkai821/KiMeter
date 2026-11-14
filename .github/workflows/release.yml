@@ -1,0 +1,82 @@
+name: Build & Release
+
+# 改 Info.plist 的版本號（CFBundleShortVersionString）並推上 main 就會自動發佈；
+# 也可以在 Actions 頁面手動執行。
+# App 一律由這個流程從原始碼編譯並上傳，不會手動上傳檔案。
+on:
+  push:
+    branches: [main]
+    paths: ["Info.plist"]
+  workflow_dispatch:
+
+# 預設只能讀取；只有發佈那一步拿得到寫入權限
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      # 第三方 action 固定在特定 commit，避免被換成惡意版本（v4.4.0）
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Read version
+        id: ver
+        run: echo "tag=KM-v$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to overwrite an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::$TAG 已經發佈過。已發佈的版本不可覆蓋，請改用新的版本號。"
+            exit 1
+          fi
+
+      - name: Build universal app
+        run: UNIVERSAL=1 bash build.sh
+
+      - name: Verify signature and hardened runtime
+        run: |
+          codesign --verify --deep --strict build/KiMeter.app
+          codesign -dv build/KiMeter.app 2>&1 | tee sig.txt
+          grep -q "runtime" sig.txt
+          lipo -archs build/KiMeter.app/Contents/MacOS/KiMeter | grep -q "x86_64 arm64"
+
+      - name: Smoke test (app launches and stays running)
+        run: |
+          build/KiMeter.app/Contents/MacOS/KiMeter &
+          PID=$!
+          sleep 10
+          kill -0 "$PID"
+          kill "$PID"
+
+      - name: Package
+        run: ditto -c -k --keepParent build/KiMeter.app build/KiMeter-macOS.zip
+
+      - name: Add checksum to release notes
+        run: |
+          SUM=$(shasum -a 256 build/KiMeter-macOS.zip | cut -d' ' -f1)
+          cp RELEASE_NOTES.md build/notes.md
+          printf '\n**KiMeter-macOS.zip 的 SHA-256：**\n\n```\n%s\n```\n' "$SUM" >> build/notes.md
+          echo "SHA-256: $SUM" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          gh release create "$TAG" build/KiMeter-macOS.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "KiMeter ${TAG/-/ }" \
+            --notes-file build/notes.md
